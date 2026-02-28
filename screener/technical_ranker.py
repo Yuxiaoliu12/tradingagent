@@ -32,13 +32,27 @@ class TechnicalRanker:
         "obv_slope",
     ]
     NEWS_FEATURES = ["news_sentiment", "news_significance", "policy_flag"]
-    ALL_FEATURES = TECH_FEATURES + NEWS_FEATURES
+    INDUSTRY_FEATURES = ["industry_code"]
+    ALL_FEATURES = TECH_FEATURES + NEWS_FEATURES + INDUSTRY_FEATURES
 
     def __init__(self, cfg: ScreenerConfig | None = None):
         self.cfg = cfg or ScreenerConfig()
         self.model: MultiOutputRegressor | None = None
         self.news_scorer: NewsScorer | None = None
         self._feature_cache: dict[str, pd.DataFrame] = {}
+        self._industry_map: dict[str, int] = {}
+
+    def set_industry_mapping(self, mapping: dict[str, str]) -> None:
+        """Label-encode CSRC industry codes to integers for XGBoost.
+
+        Args:
+            mapping: Dict[symbol, industry_code] e.g. {"sh.600000": "J66"}.
+        """
+        unique_codes = sorted(set(mapping.values()))
+        code_to_int = {code: i for i, code in enumerate(unique_codes)}
+        self._industry_map = {sym: code_to_int[code] for sym, code in mapping.items()}
+        print(f"Industry mapping set: {len(self._industry_map)} stocks, "
+              f"{len(unique_codes)} unique industries")
 
     # ── Feature Computation ──────────────────────────────────────────────
 
@@ -273,10 +287,18 @@ class TechnicalRanker:
             news_df = self._get_news_features(list(tech_df.index))
             tech_df = tech_df.join(news_df, how="left")
 
-        # Fill missing with 0
+        # Add industry code (label-encoded integer, -1 for unknown)
+        if self._industry_map:
+            tech_df["industry_code"] = [
+                self._industry_map.get(sym, -1) for sym in tech_df.index
+            ]
+        else:
+            tech_df["industry_code"] = -1
+
+        # Fill missing with 0 (except industry_code which uses -1 for unknown)
         for col in self.ALL_FEATURES:
             if col not in tech_df.columns:
-                tech_df[col] = 0.0
+                tech_df[col] = -1 if col == "industry_code" else 0.0
         tech_df = tech_df[self.ALL_FEATURES].fillna(0)
         return tech_df
 

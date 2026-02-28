@@ -26,6 +26,7 @@ from screener.utils import (
 
 _ohlcv_cache: dict[str, pd.DataFrame] | None = None
 _benchmark_cache: pd.DataFrame | None = None
+_industry_cache: dict[str, str] | None = None
 
 
 def init_data(cfg: ScreenerConfig | None = None):
@@ -61,6 +62,26 @@ def _get_benchmark_cache(cfg: ScreenerConfig) -> pd.DataFrame:
     if _benchmark_cache is None:
         init_data(cfg)
     return _benchmark_cache
+
+
+def load_industry_mapping(cfg: ScreenerConfig) -> dict[str, str]:
+    """Load symbol → CSRC industry code mapping.
+
+    Returns Dict[str, str] e.g. {"sh.600000": "J66"}.
+    Returns empty dict if the pickle file doesn't exist.
+    """
+    global _industry_cache
+    if _industry_cache is not None:
+        return _industry_cache
+
+    path = cfg.industry_pickle_path
+    if os.path.exists(path):
+        _industry_cache = pd.read_pickle(path)
+        print(f"Industry mapping loaded: {len(_industry_cache)} stocks from {path}")
+    else:
+        print(f"WARNING: Industry mapping not found at {path}. Using empty mapping.")
+        _industry_cache = {}
+    return _industry_cache
 
 
 # ── Calendar helpers ─────────────────────────────────────────────────────────

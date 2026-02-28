@@ -15,6 +15,7 @@ class ScreenerConfig:
     # ── Data Sources ─────────────────────────────────────────────────────
     ohlcv_pickle_path: str = "data/ohlcv_all_a.pkl"
     benchmark_pickle_path: str = "data/benchmark_000905.pkl"
+    industry_pickle_path: str = "data/industry_mapping.pkl"
     benchmark: str = "sh.000905"
 
     # ── Layer 1 — Factor Timing (XGBoost) ────────────────────────────────

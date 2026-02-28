@@ -30,6 +30,7 @@ import pandas as pd
 DATA_DIR = os.path.join(os.path.dirname(__file__), os.pardir, "data")
 OHLCV_PATH = os.path.join(DATA_DIR, "ohlcv_all_a.pkl")
 BENCH_PATH = os.path.join(DATA_DIR, "benchmark_000905.pkl")
+INDUSTRY_PATH = os.path.join(DATA_DIR, "industry_mapping.pkl")
 FIELDS = "date,open,high,low,close,volume,amount"
 NUMERIC_COLS = ["open", "high", "low", "close", "volume", "amount"]
 
@@ -117,6 +118,43 @@ def download_universe_ohlcv(
     return data
 
 
+def download_industry_mapping(
+    date: str = "2026-02-25",
+    save_path: str = INDUSTRY_PATH,
+) -> Dict[str, str]:
+    """Download CSRC industry classification for all A-shares.
+
+    Returns Dict[symbol, industry_code] e.g. {"sh.600000": "J66"}.
+    The industry code is the 1-letter + 2-digit prefix from the CSRC
+    classification (e.g. "J66货币金融服务" → "J66").
+    """
+    import re
+
+    rs = bs.query_stock_industry(code="", date=date)
+    rows = []
+    while (rs.error_code == "0") and rs.next():
+        rows.append(rs.get_row_data())
+    if not rows:
+        print("WARNING: query_stock_industry returned no data")
+        return {}
+
+    df = pd.DataFrame(rows, columns=rs.fields)
+    mapping: Dict[str, str] = {}
+    for _, row in df.iterrows():
+        code = row.get("code", "")
+        industry = row.get("industry", "")
+        if not code or not industry:
+            continue
+        # Extract industry code prefix: letter(s) + digits, e.g. "J66" from "J66货币金融服务"
+        m = re.match(r"([A-Z]\d{2})", industry)
+        if m:
+            mapping[code] = m.group(1)
+
+    _save_pickle(mapping, save_path)
+    print(f"Industry mapping: {len(mapping)} stocks → {save_path}")
+    return mapping
+
+
 def download_benchmark(
     index_code: str = "sh.000905",
     start_date: str = "2015-01-01",
@@ -154,6 +192,7 @@ if __name__ == "__main__":
 
     download_universe_ohlcv(symbols, args.start, args.end)
     download_benchmark(start_date=args.start, end_date=args.end)
+    download_industry_mapping()
 
     bs.logout()
     print("Done.")

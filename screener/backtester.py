@@ -21,6 +21,7 @@ from screener.data_pipeline import (
     load_alpha158_factors,
     load_alpha158_labels,
     load_alpha158_year,
+    load_industry_mapping,
     load_market_regime_features,
     load_raw_ohlcv,
     get_calendar,
@@ -83,6 +84,10 @@ class WalkForwardBacktester:
 
         # Precompute Layer 2 technical features for all stocks (cache for fast lookup)
         self.layer2.precompute_features(self._ohlcv)
+
+        # Load CSRC industry classification for Layer 2
+        industry_map = load_industry_mapping(self.cfg)
+        self.layer2.set_industry_mapping(industry_map)
 
         # Cache forward returns once (used by Layer 2 training in every window)
         self._upside_returns, self._downside_returns, self._combined_returns = (
