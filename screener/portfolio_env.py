@@ -511,9 +511,9 @@ class PortfolioEnv(gymnasium.Env):
             return False
         row = ohlcv.loc[date]
 
-        # Suspension
+        # Suspension (NaN or 0)
         vol = row.get("volume", row.get("vol", 0))
-        if vol <= 0:
+        if not (vol > 0):
             return False
 
         prev_close = self._get_prev_close(symbol, date)
@@ -660,9 +660,9 @@ class PortfolioEnv(gymnasium.Env):
             return False
         row = ohlcv.loc[date]
 
-        # Suspension
+        # Suspension (NaN or 0)
         vol = row.get("volume", row.get("vol", 0))
-        if vol <= 0:
+        if not (vol > 0):
             return False
 
         # 一字板 — can't sell regardless of direction

@@ -825,6 +825,24 @@ class WalkForwardBacktester:
                 l2_ranking = l1_picks[: self.cfg.layer2_top_n]
                 l2_features = pd.DataFrame()
 
+            # Filter out suspended stocks (volume=0 or NaN) so the RL
+            # agent can't allocate to untradeable symbols at stale prices.
+            suspended = set()
+            for sym in l2_ranking:
+                ohlcv_df = self._ohlcv.get(sym)
+                if ohlcv_df is None or date not in ohlcv_df.index:
+                    suspended.add(sym)
+                    continue
+                vol = ohlcv_df.loc[date].get("vol", ohlcv_df.loc[date].get("volume", 0))
+                if not (vol > 0):  # catches NaN and 0
+                    suspended.add(sym)
+            if suspended:
+                l2_ranking = [s for s in l2_ranking if s not in suspended]
+                l2_combined = l2_combined.drop(suspended, errors="ignore")
+                l2_upside = l2_upside.drop(suspended, errors="ignore")
+                l2_downside = l2_downside.drop(suspended, errors="ignore")
+                l2_features = l2_features.drop(suspended, errors="ignore")
+
             signals.append({
                 "date": date,
                 "l2_scores": l2_combined,
@@ -836,12 +854,18 @@ class WalkForwardBacktester:
 
         return signals
 
-    def run_rl(self, verbose: bool = True) -> dict:
+    def run_rl(self, verbose: bool = True, inference_only: bool = False) -> dict:
         """Walk-forward backtest using the RL portfolio agent.
 
         Same window schedule as run() but replaces the paper trader with
         a MaskablePPO agent trained on PortfolioEnv.  Checkpoints after each
         completed window so the run can resume after disconnects.
+
+        Args:
+            verbose: Print progress.
+            inference_only: If True, skip PPO training and load existing
+                models from {run_dir}/rl_model_window_{wi}.  Useful for
+                re-evaluating with updated signals without retraining.
 
         Returns dict with keys: metrics, nav_series, window_results.
         """
@@ -871,8 +895,8 @@ class WalkForwardBacktester:
         benchmark_df = _get_benchmark_cache(self.cfg)
         rl_trader = RLTrader(self.cfg)
 
-        # Check for existing checkpoint to resume from
-        rl_ckpt = self._load_rl_checkpoint()
+        # Check for existing checkpoint to resume from (skip in inference_only)
+        rl_ckpt = self._load_rl_checkpoint() if not inference_only else None
         if rl_ckpt is not None:
             resume_from = rl_ckpt["completed_window"] + 1
             all_nav = rl_ckpt["all_nav"]
@@ -942,21 +966,31 @@ class WalkForwardBacktester:
                 self._save_rl_checkpoint(wi, all_nav, window_results, running_capital)
                 continue
 
-            # ── Train PPO ─────────────────────────────────────────────
-            print("\n  Training PPO agent…")
-            train_env = PortfolioEnv(
-                self.cfg, train_signals, self._ohlcv,
-                benchmark_df, training_mode=True,
-            )
-            model = rl_trader.train(train_env)
-
-            # Save model
+            # ── Train or load PPO ─────────────────────────────────────
             model_path = os.path.join(
                 self.cfg.run_dir, f"rl_model_window_{wi}"
             )
-            os.makedirs(os.path.dirname(model_path), exist_ok=True)
-            rl_trader.save(model, model_path)
-            print(f"  Model saved → {model_path}")
+
+            if inference_only:
+                # Load existing model — skip training entirely
+                try:
+                    model = rl_trader.load(model_path)
+                    print(f"  Loaded RL model ← {model_path}")
+                except FileNotFoundError:
+                    print(f"  ERROR: No saved model at {model_path}. "
+                          f"Run with inference_only=False first.")
+                    continue
+            else:
+                print("\n  Training PPO agent…")
+                train_env = PortfolioEnv(
+                    self.cfg, train_signals, self._ohlcv,
+                    benchmark_df, training_mode=True,
+                )
+                model = rl_trader.train(train_env)
+
+                os.makedirs(os.path.dirname(model_path), exist_ok=True)
+                rl_trader.save(model, model_path)
+                print(f"  Model saved → {model_path}")
 
             # ── Inference on test period ──────────────────────────────
             if len(test_signals) == 0:
