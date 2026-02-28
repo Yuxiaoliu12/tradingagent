@@ -563,6 +563,30 @@ class WalkForwardBacktester:
         print(f"  L1+L2 models loaded from cache (window {wi+1})")
         return True
 
+    # ── Per-Window Signal Cache ──────────────────────────────────────
+    # Persists L1+L2 daily signals per window so that repeated RL runs
+    # skip the expensive signal generation step entirely.
+
+    def _signal_cache_path(self, wi: int, split: str) -> str:
+        return os.path.join(
+            self.cfg.cache_dir, "signals", f"window_{wi}_{split}.pkl"
+        )
+
+    def _load_cached_signals(self, wi: int, split: str) -> list[dict] | None:
+        """Load cached signals for a window/split. Returns None if not cached."""
+        path = self._signal_cache_path(wi, split)
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as f:
+            return pickle.load(f)
+
+    def _save_signals(self, signals: list[dict], wi: int, split: str):
+        """Save signals to cache."""
+        path = self._signal_cache_path(wi, split)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump(signals, f)
+
     # ── RL Checkpointing ─────────────────────────────────────────────
 
     def _rl_checkpoint_path(self) -> str:
@@ -629,6 +653,98 @@ class WalkForwardBacktester:
         with open(path, "w") as f:
             json.dump(payload, f, indent=2, default=str)
         print(f"  RL results saved → {path}")
+
+    # ── Signal Precomputation ────────────────────────────────────────
+
+    def precompute_signals(self, verbose: bool = True):
+        """Generate and cache all per-window L1+L2 signals to disk.
+
+        Run this once before iterating on RL hyperparameters. Subsequent
+        ``run_rl()`` calls will load cached signals and skip L1+L2 entirely.
+        """
+        if self._ohlcv is None:
+            self.load_data()
+
+        windows = self._generate_retrain_windows()
+        print(f"\nPrecomputing signals for {len(windows)} windows")
+
+        total_days = 0
+        total_bytes = 0
+
+        for wi, window in enumerate(windows):
+            print(f"\n{'='*60}")
+            print(
+                f"Window {wi+1}/{len(windows)} [{window['mode']}]: "
+                f"train {window['train_start']} → {window['train_end']}  "
+                f"test {window['test_start']} → {window['test_end']}"
+            )
+            print(f"{'='*60}")
+
+            # Check if both splits already cached
+            train_cached = self._load_cached_signals(wi, "train")
+            test_cached = self._load_cached_signals(wi, "test")
+            if train_cached is not None and test_cached is not None:
+                n = len(train_cached) + len(test_cached)
+                print(f"  Already cached ({n} days), skipping")
+                total_days += n
+                total_bytes += (
+                    os.path.getsize(self._signal_cache_path(wi, "train"))
+                    + os.path.getsize(self._signal_cache_path(wi, "test"))
+                )
+                continue
+
+            # Train / fine-tune L1+L2 (skip if model cache exists)
+            if not self._load_window_models(wi):
+                if window["mode"] == "initial":
+                    self._train_layer1(window["train_start"], window["train_end"])
+                    self._train_layer2(window["train_start"], window["train_end"])
+                else:
+                    self._finetune_layer1(window["train_start"], window["train_end"])
+                    self._finetune_layer2(window["train_start"], window["train_end"])
+                self._save_window_models(wi)
+
+            # Ensure lagged IC covers train+test period
+            train_start_year = pd.Timestamp(window["train_start"]).year
+            test_end_year = pd.Timestamp(window["test_end"]).year
+            self.layer1.ensure_lagged_ic(range(train_start_year, test_end_year + 1))
+
+            # Generate and cache train signals
+            if train_cached is None:
+                print("\n  Generating train signals…")
+                train_signals = self._generate_daily_signals(
+                    window["train_start"], window["train_end"], verbose=verbose
+                )
+                self._save_signals(train_signals, wi, "train")
+                print(f"  Cached {len(train_signals)} train days")
+            else:
+                train_signals = train_cached
+                print(f"  Train signals already cached ({len(train_signals)} days)")
+
+            # Generate and cache test signals
+            if test_cached is None:
+                print("  Generating test signals…")
+                test_signals = self._generate_daily_signals(
+                    window["test_start"], window["test_end"], verbose=verbose
+                )
+                self._save_signals(test_signals, wi, "test")
+                print(f"  Cached {len(test_signals)} test days")
+            else:
+                test_signals = test_cached
+                print(f"  Test signals already cached ({len(test_signals)} days)")
+
+            n = len(train_signals) + len(test_signals)
+            total_days += n
+            total_bytes += (
+                os.path.getsize(self._signal_cache_path(wi, "train"))
+                + os.path.getsize(self._signal_cache_path(wi, "test"))
+            )
+
+        print(f"\n{'='*60}")
+        print(f"Signal precomputation complete")
+        print(f"  Total days: {total_days}")
+        print(f"  Total size: {total_bytes / 1024 / 1024:.1f} MB")
+        print(f"  Cache path: {os.path.join(self.cfg.cache_dir, 'signals')}")
+        print(f"{'='*60}")
 
     # ── RL Backtest ─────────────────────────────────────────────────────
 
@@ -757,33 +873,43 @@ class WalkForwardBacktester:
             )
             print(f"{'='*60}")
 
-            # ── Train / fine-tune L1+L2 (skip if cached) ──────────────
-            if not self._load_window_models(wi):
-                if window["mode"] == "initial":
-                    self._train_layer1(window["train_start"], window["train_end"])
-                    self._train_layer2(window["train_start"], window["train_end"])
-                else:
-                    self._finetune_layer1(window["train_start"], window["train_end"])
-                    self._finetune_layer2(window["train_start"], window["train_end"])
-                self._save_window_models(wi)
+            # ── Load cached signals or generate on-the-fly ─────────
+            train_signals = self._load_cached_signals(wi, "train")
+            test_signals = self._load_cached_signals(wi, "test")
 
-            # Ensure lagged IC covers test period
-            test_start_year = pd.Timestamp(window["test_start"]).year
-            test_end_year = pd.Timestamp(window["test_end"]).year
-            self.layer1.ensure_lagged_ic(range(test_start_year, test_end_year + 1))
+            if train_signals is not None and test_signals is not None:
+                # Cached path — skip L1+L2 entirely
+                print(
+                    f"  Loaded cached signals: "
+                    f"{len(train_signals)} train, {len(test_signals)} test days"
+                )
+            else:
+                # Fall back to generating on-the-fly (backwards compatible)
+                if not self._load_window_models(wi):
+                    if window["mode"] == "initial":
+                        self._train_layer1(window["train_start"], window["train_end"])
+                        self._train_layer2(window["train_start"], window["train_end"])
+                    else:
+                        self._finetune_layer1(window["train_start"], window["train_end"])
+                        self._finetune_layer2(window["train_start"], window["train_end"])
+                    self._save_window_models(wi)
 
-            # ── Generate signals ──────────────────────────────────────
-            print("\n  Generating training signals…")
-            train_signals = self._generate_daily_signals(
-                window["train_start"], window["train_end"], verbose=verbose
-            )
-            print(f"  Training signals: {len(train_signals)} days")
+                # Ensure lagged IC covers test period
+                test_start_year = pd.Timestamp(window["test_start"]).year
+                test_end_year = pd.Timestamp(window["test_end"]).year
+                self.layer1.ensure_lagged_ic(range(test_start_year, test_end_year + 1))
 
-            print("  Generating test signals…")
-            test_signals = self._generate_daily_signals(
-                window["test_start"], window["test_end"], verbose=verbose
-            )
-            print(f"  Test signals: {len(test_signals)} days")
+                print("\n  Generating training signals…")
+                train_signals = self._generate_daily_signals(
+                    window["train_start"], window["train_end"], verbose=verbose
+                )
+                print(f"  Training signals: {len(train_signals)} days")
+
+                print("  Generating test signals…")
+                test_signals = self._generate_daily_signals(
+                    window["test_start"], window["test_end"], verbose=verbose
+                )
+                print(f"  Test signals: {len(test_signals)} days")
 
             if len(train_signals) < 20:
                 print("  Skipping window (insufficient training signals)")
