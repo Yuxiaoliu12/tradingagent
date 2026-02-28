@@ -8,8 +8,8 @@ matplotlib>=3.7
 
 # RL
 gymnasium>=0.29
-stable-baselines3>=2.2
-sb3-contrib>=2.2
+stable-baselines3==2.7.1
+sb3-contrib==2.7.1
 
 # Colab data download
 baostock>=0.8
