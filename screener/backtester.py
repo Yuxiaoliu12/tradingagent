@@ -50,6 +50,8 @@ class WalkForwardBacktester:
         self._regime: pd.DataFrame | None = None
         self._ohlcv: dict[str, pd.DataFrame] | None = None
         self._calendar: pd.DatetimeIndex | None = None
+        self._upside_returns: pd.DataFrame | None = None
+        self._downside_returns: pd.DataFrame | None = None
         self._combined_returns: pd.DataFrame | None = None
 
     # ── Data Loading ─────────────────────────────────────────────────────
@@ -82,8 +84,10 @@ class WalkForwardBacktester:
         # Precompute Layer 2 technical features for all stocks (cache for fast lookup)
         self.layer2.precompute_features(self._ohlcv)
 
-        # Cache combined returns once (used by Layer 2 training in every window)
-        self._combined_returns = self._compute_forward_combined_returns()
+        # Cache forward returns once (used by Layer 2 training in every window)
+        self._upside_returns, self._downside_returns, self._combined_returns = (
+            self._compute_forward_returns()
+        )
 
         # Precompute lagged IC + forward IC for all years (Layer 1)
         train_start_year = pd.Timestamp(self.cfg.train_start).year
@@ -178,7 +182,7 @@ class WalkForwardBacktester:
         print(f"\n  Training Layer 2 ({train_start} → {train_end})…")
         train_dates = self._get_layer2_dates(train_start, train_end)
         X, y, w = self.layer2.build_training_data(
-            self._ohlcv, train_dates, self._combined_returns
+            self._ohlcv, train_dates, self._upside_returns, self._downside_returns
         )
         if len(X) > 0:
             self.layer2.train(X, y, sample_weight=w)
@@ -190,23 +194,33 @@ class WalkForwardBacktester:
         print(f"\n  Fine-tuning Layer 2 ({train_start} → {train_end})…")
         train_dates = self._get_layer2_dates(train_start, train_end)
         X, y, w = self.layer2.build_training_data(
-            self._ohlcv, train_dates, self._combined_returns
+            self._ohlcv, train_dates, self._upside_returns, self._downside_returns
         )
         if len(X) > 0:
             self.layer2.finetune(X, y, sample_weight=w)
         else:
             print("  Warning: no fine-tuning data for Layer 2")
 
-    def _compute_forward_combined_returns(self) -> pd.DataFrame:
-        """Compute forward combined upside + downside returns."""
+    def _compute_forward_returns(
+        self,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """Compute forward upside, downside, and combined returns.
+
+        Returns:
+            (upside_df, downside_df, combined_df) — each datetime × symbol.
+        """
         fwd = self.cfg.layer2_forward_days  # 5
-        combined_dict = {}
+        upside_dict, downside_dict = {}, {}
         for sym, df in self._ohlcv.items():
             close, high, low = df["close"], df["high"], df["low"]
             fwd_max = high[::-1].rolling(fwd, min_periods=fwd).max()[::-1].shift(-1)
             fwd_min = low[::-1].rolling(fwd, min_periods=fwd).min()[::-1].shift(-1)
-            combined_dict[sym] = (fwd_max / close - 1) + (fwd_min / close - 1)
-        return pd.DataFrame(combined_dict)
+            upside_dict[sym] = fwd_max / close - 1
+            downside_dict[sym] = fwd_min / close - 1
+        upside_df = pd.DataFrame(upside_dict)
+        downside_df = pd.DataFrame(downside_dict)
+        combined_df = upside_df + downside_df
+        return upside_df, downside_df, combined_df
 
     def _compute_forward_close_returns(self) -> pd.DataFrame:
         """Compute 5-day forward close-to-close returns (for attribution only)."""
@@ -779,9 +793,12 @@ class WalkForwardBacktester:
 
             if not l1_picks:
                 # Still emit a signal (agent may be holding stocks)
+                empty = pd.Series(dtype=float)
                 signals.append({
                     "date": date,
-                    "l2_scores": pd.Series(dtype=float),
+                    "l2_scores": empty,
+                    "l2_upside": empty,
+                    "l2_downside": empty,
                     "l2_ranking": [],
                     "l2_features": pd.DataFrame(),
                 })
@@ -789,21 +806,25 @@ class WalkForwardBacktester:
 
             # Layer 2 — ranking + features
             try:
-                l2_scores = self.layer2.rank_stocks(
+                l2_combined, l2_upside, l2_downside = self.layer2.rank_stocks(
                     self._ohlcv, l1_picks, date, include_news=False
                 )
-                l2_ranking = list(l2_scores.index)  # sorted desc
+                l2_ranking = list(l2_combined.index)  # sorted desc
                 l2_features = self.layer2.compute_features_for_stocks(
                     self._ohlcv, date=date, symbols=l1_picks, include_news=False
                 )
             except Exception:
-                l2_scores = pd.Series(dtype=float)
+                l2_combined = pd.Series(dtype=float)
+                l2_upside = pd.Series(dtype=float)
+                l2_downside = pd.Series(dtype=float)
                 l2_ranking = l1_picks[: self.cfg.layer2_top_n]
                 l2_features = pd.DataFrame()
 
             signals.append({
                 "date": date,
-                "l2_scores": l2_scores,
+                "l2_scores": l2_combined,
+                "l2_upside": l2_upside,
+                "l2_downside": l2_downside,
                 "l2_ranking": l2_ranking,
                 "l2_features": l2_features,
             })

@@ -1,8 +1,9 @@
 """
 Layer 2: Technical Ranking Model  (200 → ~30 stocks)
 
-Uses a single XGBRegressor to predict the combined upside + downside
-return over the next 5 days.  Score = predicted combined return.
+Uses a MultiOutputRegressor wrapping two XGBRegressors to predict
+upside and downside returns separately over the next 5 days.
+Combined score = predicted upside + predicted downside.
 """
 
 import os
@@ -10,6 +11,7 @@ import pickle
 
 import numpy as np
 import pandas as pd
+from sklearn.multioutput import MultiOutputRegressor
 from xgboost import XGBRegressor
 
 from screener.config import ScreenerConfig
@@ -17,7 +19,7 @@ from screener.news_scorer import NewsScorer
 
 
 class TechnicalRanker:
-    """Single XGBRegressor that ranks stocks by predicted combined return."""
+    """MultiOutput XGBRegressor that ranks stocks by predicted upside + downside."""
 
     TECH_FEATURES = [
         "macd", "macd_signal", "macd_hist",
@@ -34,7 +36,7 @@ class TechnicalRanker:
 
     def __init__(self, cfg: ScreenerConfig | None = None):
         self.cfg = cfg or ScreenerConfig()
-        self.model: XGBRegressor | None = None
+        self.model: MultiOutputRegressor | None = None
         self.news_scorer: NewsScorer | None = None
         self._feature_cache: dict[str, pd.DataFrame] = {}
 
@@ -294,21 +296,23 @@ class TechnicalRanker:
         self,
         ohlcv_dict: dict[str, pd.DataFrame],
         dates: list[pd.Timestamp],
-        combined_returns: pd.DataFrame,
+        upside_returns: pd.DataFrame,
+        downside_returns: pd.DataFrame,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
-        """Build (X, y, sample_weight) arrays for single XGBRegressor training.
+        """Build (X, y, sample_weight) arrays for MultiOutput training.
 
         Args:
             ohlcv_dict: symbol → full OHLCV history.
             dates: List of training dates.
-            combined_returns: DataFrame (datetime×symbol) of upside + downside returns.
+            upside_returns: DataFrame (datetime×symbol) of max_high/close - 1.
+            downside_returns: DataFrame (datetime×symbol) of min_low/close - 1.
 
         Returns:
             X: (total_stocks_across_days, n_features)
-            y: (total_stocks_across_days,) — combined return values
+            y: (total_stocks_across_days, 2) — [upside, downside]
             w: sample weights (or None if disabled)
         """
-        X_list, y_list, ts_list = [], [], []
+        X_list, y_up_list, y_dn_list, ts_list = [], [], [], []
 
         for dt in dates:
             feat_df = self.compute_features_for_stocks(
@@ -318,21 +322,28 @@ class TechnicalRanker:
                 continue
 
             # Get forward returns for this date
-            if dt not in combined_returns.index:
+            if dt not in upside_returns.index or dt not in downside_returns.index:
                 continue
-            fwd = combined_returns.loc[dt]
-            common = feat_df.index.intersection(fwd.dropna().index)
+            fwd_up = upside_returns.loc[dt]
+            fwd_dn = downside_returns.loc[dt]
+            common = feat_df.index.intersection(
+                fwd_up.dropna().index.intersection(fwd_dn.dropna().index)
+            )
             if len(common) < 10:
                 continue
 
             feat_df = feat_df.loc[common]
 
             X_list.append(feat_df.values)
-            y_list.append(fwd.loc[common].values)
+            y_up_list.append(fwd_up.loc[common].values)
+            y_dn_list.append(fwd_dn.loc[common].values)
             ts_list.append(np.full(len(common), dt.timestamp()))
 
         X = np.vstack(X_list).astype(np.float32)
-        y = np.concatenate(y_list).astype(np.float32)
+        y = np.column_stack([
+            np.concatenate(y_up_list),
+            np.concatenate(y_dn_list),
+        ]).astype(np.float32)
 
         # Exponential recency weights
         halflife = self.cfg.sample_weight_halflife_days
@@ -345,24 +356,27 @@ class TechnicalRanker:
         return X, y, w
 
     def train(self, X: np.ndarray, y: np.ndarray, sample_weight: np.ndarray | None = None):
-        """Fit single XGBRegressor on pre-built training data."""
+        """Fit MultiOutputRegressor (2 XGBRegressors) on pre-built training data."""
         params = dict(self.cfg.layer2_xgb_params)
-        self.model = XGBRegressor(**params)
+        base = XGBRegressor(**params)
+        self.model = MultiOutputRegressor(base)
         self.model.fit(X, y, sample_weight=sample_weight)
-        print(f"Layer 2 model trained: {X.shape[0]} samples, {X.shape[1]} features")
+        print(f"Layer 2 model trained: {X.shape[0]} samples, {X.shape[1]} features, 2 outputs")
 
     def finetune(self, X_new: np.ndarray, y_new: np.ndarray, sample_weight: np.ndarray | None = None):
-        """Warm-start: add trees to regressor using new quarter's data."""
+        """Warm-start: add trees to each sub-estimator using new quarter's data."""
         if self.model is None:
             raise RuntimeError("No base model to fine-tune. Call .train() first.")
 
         print(f"Layer 2 fine-tune: {X_new.shape[0]} samples, "
               f"+{self.cfg.finetune_n_estimators} trees @ lr={self.cfg.finetune_learning_rate}")
-        self.model.set_params(
-            n_estimators=self.cfg.finetune_n_estimators,
-            learning_rate=self.cfg.finetune_learning_rate,
-        )
-        self.model.fit(X_new, y_new, sample_weight=sample_weight, xgb_model=self.model.get_booster())
+        for i, est in enumerate(self.model.estimators_):
+            est.set_params(
+                n_estimators=self.cfg.finetune_n_estimators,
+                learning_rate=self.cfg.finetune_learning_rate,
+            )
+            est.fit(X_new, y_new[:, i], sample_weight=sample_weight,
+                    xgb_model=est.get_booster())
         print("Layer 2 fine-tune complete.")
 
     # ── Inference ────────────────────────────────────────────────────────
@@ -373,11 +387,12 @@ class TechnicalRanker:
         symbols: list[str],
         date: pd.Timestamp,
         include_news: bool = True,
-    ) -> pd.Series:
+    ) -> tuple[pd.Series, pd.Series, pd.Series]:
         """Rank symbols by predicted combined return.
 
         Returns:
-            Series indexed by symbol, sorted descending (best first).
+            (combined, upside, downside) — all Series indexed by symbol,
+            sorted by combined descending (best first).
         """
         if self.model is None:
             raise RuntimeError("Model not trained. Call .train() first.")
@@ -386,12 +401,16 @@ class TechnicalRanker:
             ohlcv_dict, date=date, symbols=symbols, include_news=include_news
         )
         if feat_df.empty:
-            return pd.Series(dtype=float)
+            empty = pd.Series(dtype=float)
+            return empty, empty, empty
 
         X = feat_df.values.astype(np.float32)
-        scores = self.model.predict(X)
-        result = pd.Series(scores, index=feat_df.index, name="rank_score")
-        return result.sort_values(ascending=False)
+        preds = self.model.predict(X)  # (n, 2): [upside, downside]
+        upside = pd.Series(preds[:, 0], index=feat_df.index, name="l2_upside")
+        downside = pd.Series(preds[:, 1], index=feat_df.index, name="l2_downside")
+        combined = pd.Series(preds[:, 0] + preds[:, 1], index=feat_df.index, name="rank_score")
+        order = combined.sort_values(ascending=False).index
+        return combined.loc[order], upside.loc[order], downside.loc[order]
 
     def select_top(
         self,
@@ -401,8 +420,8 @@ class TechnicalRanker:
         **kwargs,
     ) -> list[str]:
         """Return top-N symbols."""
-        scores = self.rank_stocks(ohlcv_dict, symbols, date, **kwargs)
-        return list(scores.head(self.cfg.layer2_top_n).index)
+        combined, _, _ = self.rank_stocks(ohlcv_dict, symbols, date, **kwargs)
+        return list(combined.head(self.cfg.layer2_top_n).index)
 
     # ── Persistence ──────────────────────────────────────────────────────
 

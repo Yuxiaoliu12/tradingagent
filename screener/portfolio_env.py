@@ -23,9 +23,9 @@ from screener.utils import get_limit_threshold
 _SLOT_TECH_FEATURES = [
     "mom_5", "mom_20", "rsi_14", "bb_position", "volume_trend", "atr_14",
 ]
-_N_SLOT_FEATURES = 11   # l2_score + 6 tech + 4 position state
+_N_SLOT_FEATURES = 12   # l2_upside + l2_downside + 6 tech + 4 position state
 _N_GLOBAL_FEATURES = 4
-# Total: 3 × 11 + 4 = 37
+# Total: 3 × 12 + 4 = 40
 
 
 def _obs_dim(n_slots: int) -> int:
@@ -63,7 +63,7 @@ class PortfolioEnv(gymnasium.Env):
     """PPO environment for 3-stock portfolio management with action masking.
 
     Action:  index into precomputed table of (weight, timing) combos.
-    Obs:     per-slot features (11 each) + global features (4) = 37 dims.
+    Obs:     per-slot features (12 each) + global features (4) = 40 dims.
     Reward:  rolling 5-day log return × 10.
     """
 
@@ -353,26 +353,27 @@ class PortfolioEnv(gymnasium.Env):
     # ── Observation Builder ───────────────────────────────────────────
 
     def _build_obs(self) -> np.ndarray:
-        """Build observation vector (37-dim for 3 slots)."""
+        """Build observation vector (40-dim for 3 slots)."""
         dim = _obs_dim(self._n_slots)
         if self._day_idx >= len(self._daily_signals):
             return np.zeros(dim, dtype=np.float32)
 
         signals = self._daily_signals[self._day_idx]
         date = signals["date"]
-        l2_scores = signals.get("l2_scores", pd.Series(dtype=float))
+        l2_upside = signals.get("l2_upside", pd.Series(dtype=float))
+        l2_downside = signals.get("l2_downside", pd.Series(dtype=float))
         l2_features = signals.get("l2_features", pd.DataFrame())
 
-        # Z-score L2 scores within the day
-        if len(l2_scores) > 1:
-            s_mean = l2_scores.mean()
-            s_std = l2_scores.std()
-            if s_std > 1e-9:
-                l2_scores_z = ((l2_scores - s_mean) / s_std).clip(-3, 3)
-            else:
-                l2_scores_z = l2_scores * 0
-        else:
-            l2_scores_z = l2_scores * 0
+        # Z-score upside and downside independently within the day
+        def _zscore(s: pd.Series) -> pd.Series:
+            if len(s) > 1:
+                mu, sigma = s.mean(), s.std()
+                if sigma > 1e-9:
+                    return ((s - mu) / sigma).clip(-3, 3)
+            return s * 0
+
+        upside_z = _zscore(l2_upside)
+        downside_z = _zscore(l2_downside)
 
         obs = np.zeros(dim, dtype=np.float32)
 
@@ -381,11 +382,13 @@ class PortfolioEnv(gymnasium.Env):
                 continue
             off = i * _N_SLOT_FEATURES
 
-            # 1. L2 score (standardised)
-            if sym in l2_scores_z.index:
-                obs[off] = float(l2_scores_z[sym])
+            # 1-2. L2 upside + downside (standardised)
+            if sym in upside_z.index:
+                obs[off] = float(upside_z[sym])
+            if sym in downside_z.index:
+                obs[off + 1] = float(downside_z[sym])
 
-            # 2-7. Tech features (normalised to ~[-1, 1])
+            # 3-8. Tech features (normalised to ~[-1, 1])
             if sym in l2_features.index:
                 row = l2_features.loc[sym]
                 close_price = self._get_price(sym, date, "close")
@@ -405,18 +408,18 @@ class PortfolioEnv(gymnasium.Env):
                             val = np.clip(val, 0.0, 0.1) * 10.0     # [0, 1]
                         elif feat == "volume_trend":
                             val = np.clip(val, -2.0, 2.0) / 2.0     # [-1, 1]
-                    obs[off + 1 + j] = val
+                    obs[off + 2 + j] = val
 
-            # 8-11. Position features
+            # 9-12. Position features
             h = self._holdings.get(sym)
             if h:
-                obs[off + 7] = 1.0  # is_held
-                obs[off + 8] = self._weights.get(sym, 0.0)  # current_weight
-                obs[off + 9] = min(h["hold_days"] / 20.0, 1.0)  # hold_days_norm
+                obs[off + 8] = 1.0  # is_held
+                obs[off + 9] = self._weights.get(sym, 0.0)  # current_weight
+                obs[off + 10] = min(h["hold_days"] / 20.0, 1.0)  # hold_days_norm
                 cp = self._get_price(sym, date, "close")
                 if cp and h["entry_price"] > 0:
                     pnl = cp / h["entry_price"] - 1.0
-                    obs[off + 10] = np.clip(pnl, -0.5, 0.5) / 0.5  # [-1, 1]
+                    obs[off + 11] = np.clip(pnl, -0.5, 0.5) / 0.5  # [-1, 1]
 
         # Global features
         g = self._n_slots * _N_SLOT_FEATURES
