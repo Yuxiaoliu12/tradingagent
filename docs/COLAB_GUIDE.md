@@ -9,24 +9,12 @@
 
 ## 1. Initial Setup (first time only)
 
-### 1a. Upload the repo to Colab
+### 1a. Get the repo
 
-Option A — Clone from GitHub:
-
-```python
-!git clone https://github.com/<your-user>/tradingagent.git /content/tradingagent
-```
-
-Option B — Upload from Google Drive:
+The notebooks clone from GitHub automatically. No need to upload the repo to Drive.
 
 ```python
-# If you keep the repo on Drive:
-!cp -r /content/drive/MyDrive/kronos/tradingagent /content/tradingagent
-```
-
-### 1b. Install dependencies
-
-```python
+!git clone https://github.com/Yuxiaoliu12/tradingagent.git /content/tradingagent
 !pip install -r /content/tradingagent/requirements.txt -q
 ```
 
