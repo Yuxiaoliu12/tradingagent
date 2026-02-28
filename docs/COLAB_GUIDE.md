@@ -84,8 +84,8 @@ sys.path.insert(0, '/content/tradingagent')  # ← adjust this
 If you have fine-tuned Kronos weights, set the paths here:
 
 ```python
-cfg.kronos_tokenizer_path = '/content/drive/MyDrive/screener/models/kronos_tokenizer'
-cfg.kronos_predictor_path = '/content/drive/MyDrive/screener/models/kronos_predictor'
+cfg.kronos_tokenizer_path = '/content/drive/MyDrive/kronos/models/kronos_tokenizer'
+cfg.kronos_predictor_path = '/content/drive/MyDrive/kronos/models/kronos_predictor'
 ```
 
 ### Cell 3 — Compute Alpha158 Factors
