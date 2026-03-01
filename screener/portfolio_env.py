@@ -126,6 +126,7 @@ class PortfolioEnv(gymnasium.Env):
         self._holdings: dict[str, dict] = {}   # sym → {shares, entry_price, hold_days}
         self._weights: dict[str, float] = {}   # sym → drifted weight
         self._active_slots: list[str | None] = []
+        self.trade_log: list[dict] = []
 
     # ── Gymnasium API ─────────────────────────────────────────────────────
 
@@ -138,6 +139,7 @@ class PortfolioEnv(gymnasium.Env):
         self._nav_history = [self.cfg.initial_capital]
         self._holdings = {}
         self._weights = {}
+        self.trade_log = []
 
         self._active_slots = self._get_active_slots()
         obs = self._build_obs()
@@ -207,6 +209,15 @@ class PortfolioEnv(gymnasium.Env):
             proceeds = shares_to_sell * sell_price
             commission = proceeds * (self.cfg.sell_commission + self.cfg.stamp_tax)
             self._cash += proceeds - commission
+
+            pnl = (sell_price - h["entry_price"]) * shares_to_sell - commission
+            self.trade_log.append({
+                "date": date, "symbol": sym, "action": "sell",
+                "price": sell_price, "shares": shares_to_sell,
+                "commission": commission, "pnl": pnl,
+                "hold_days": h["hold_days"], "timing": timing,
+                "prev_close": self._get_prev_close(sym, date),
+            })
 
             h["shares"] -= shares_to_sell
             if h["shares"] <= 0:
@@ -644,6 +655,14 @@ class PortfolioEnv(gymnasium.Env):
 
             # Execute buy
             self._cash -= total_cost
+
+            self.trade_log.append({
+                "date": date, "symbol": sym, "action": "buy",
+                "price": buy_price, "shares": shares_to_buy,
+                "commission": commission, "pnl": 0.0,
+                "hold_days": 0, "timing": timing,
+                "prev_close": self._get_prev_close(sym, date),
+            })
 
             if h:
                 old_cost = h["shares"] * h["entry_price"]

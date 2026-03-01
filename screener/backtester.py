@@ -617,11 +617,13 @@ class WalkForwardBacktester:
         all_nav: list[tuple],
         window_results: list[dict],
         running_capital: float = 0.0,
+        all_trades: list[dict] | None = None,
     ):
         """Save RL backtest progress after a completed quarterly window."""
         ckpt = {
             "completed_window": wi,
             "all_nav": all_nav,
+            "all_trades": all_trades or [],
             "window_results": window_results,
             "running_capital": running_capital,
             # L1+L2 model state (needed to generate signals on resume)
@@ -913,6 +915,7 @@ class WalkForwardBacktester:
         if rl_ckpt is not None:
             resume_from = rl_ckpt["completed_window"] + 1
             all_nav = rl_ckpt["all_nav"]
+            all_trades = rl_ckpt.get("all_trades", [])
             window_results = rl_ckpt["window_results"]
             running_capital = rl_ckpt["running_capital"]
             self.layer1.model = rl_ckpt["layer1_model"]
@@ -922,6 +925,7 @@ class WalkForwardBacktester:
         else:
             resume_from = 0
             all_nav: list[tuple[pd.Timestamp, float]] = []
+            all_trades: list[dict] = []
             window_results: list[dict] = []
             running_capital: float = float(self.cfg.initial_capital)
 
@@ -976,7 +980,7 @@ class WalkForwardBacktester:
 
             if len(train_signals) < 20:
                 print("  Skipping window (insufficient training signals)")
-                self._save_rl_checkpoint(wi, all_nav, window_results, running_capital)
+                self._save_rl_checkpoint(wi, all_nav, window_results, running_capital, all_trades)
                 continue
 
             # ── Train or load PPO ─────────────────────────────────────
@@ -1012,7 +1016,7 @@ class WalkForwardBacktester:
             # ── Inference on test period ──────────────────────────────
             if len(test_signals) == 0:
                 print("  Skipping inference (no test signals)")
-                self._save_rl_checkpoint(wi, all_nav, window_results, running_capital)
+                self._save_rl_checkpoint(wi, all_nav, window_results, running_capital, all_trades)
                 continue
 
             print("\n  Running inference…")
@@ -1055,6 +1059,9 @@ class WalkForwardBacktester:
                 if terminated or truncated:
                     break
 
+            # Collect trade log from this window
+            all_trades.extend(test_env.trade_log)
+
             # Collect NAV — scale to running capital for continuity
             test_nav = test_env._nav_history
             test_dates = [s["date"] for s in test_signals]
@@ -1090,7 +1097,7 @@ class WalkForwardBacktester:
             self._save_rl_results_json(window_results)
 
             # Checkpoint after each completed window
-            self._save_rl_checkpoint(wi, all_nav, window_results, running_capital)
+            self._save_rl_checkpoint(wi, all_nav, window_results, running_capital, all_trades)
 
         # ── Aggregate results ─────────────────────────────────────────
         if all_nav:
@@ -1122,6 +1129,7 @@ class WalkForwardBacktester:
             "metrics": metrics,
             "nav_series": nav_series,
             "window_results": window_results,
+            "trade_log": all_trades,
         }
 
     @staticmethod
