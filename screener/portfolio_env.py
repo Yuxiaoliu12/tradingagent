@@ -76,6 +76,7 @@ class PortfolioEnv(gymnasium.Env):
         ohlcv_dict: dict[str, pd.DataFrame],
         benchmark_df: pd.DataFrame,
         training_mode: bool = True,
+        candidate_mode: str = "top",
     ):
         """
         Args:
@@ -86,12 +87,18 @@ class PortfolioEnv(gymnasium.Env):
             ohlcv_dict: {symbol: DataFrame with open/high/low/close/volume}.
             benchmark_df: DataFrame with benchmark OHLCV (needs 'close').
             training_mode: if True, randomly sample candidates from L2 top-N.
+            candidate_mode: how to pick candidates during inference:
+                "top" — best from L2 ranking (default);
+                "random_l2" — random from L2 top 30;
+                "bottom_l2" — worst of L2 top 30;
+                "random_l1" — random from full L1 pool.
         """
         super().__init__()
         self.cfg = cfg
         self._daily_signals = daily_signals
         self._ohlcv_dict = ohlcv_dict
         self._training_mode = training_mode
+        self._candidate_mode = candidate_mode
         self._n_slots = cfg.rl_n_slots
 
         # Action table
@@ -285,9 +292,23 @@ class PortfolioEnv(gymnasium.Env):
             top_n = self.cfg.layer2_top_n
             top_candidates = candidates[:top_n]
 
-            if self._training_mode and len(top_candidates) > remaining:
-                selected = random.sample(top_candidates, remaining)
-            else:
+            if self._training_mode:
+                # Training: random from top-N (unchanged)
+                if len(top_candidates) > remaining:
+                    selected = random.sample(top_candidates, remaining)
+                else:
+                    selected = top_candidates[:remaining]
+            elif self._candidate_mode == "random_l2":
+                pool = candidates[:30]
+                k = min(len(pool), remaining)
+                selected = random.sample(pool, k) if k > 0 else []
+            elif self._candidate_mode == "bottom_l2":
+                pool = candidates[:30]
+                selected = list(reversed(pool))[:remaining]
+            elif self._candidate_mode == "random_l1":
+                k = min(len(candidates), remaining)
+                selected = random.sample(candidates, k) if k > 0 else []
+            else:  # "top" (default)
                 selected = top_candidates[:remaining]
             slots.extend(selected)
 

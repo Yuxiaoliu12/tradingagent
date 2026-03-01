@@ -854,7 +854,13 @@ class WalkForwardBacktester:
 
         return signals
 
-    def run_rl(self, verbose: bool = True, inference_only: bool = False) -> dict:
+    def run_rl(
+        self,
+        verbose: bool = True,
+        inference_only: bool = False,
+        candidate_mode: str = "top",
+        action_mode: str = "policy",
+    ) -> dict:
         """Walk-forward backtest using the RL portfolio agent.
 
         Same window schedule as run() but replaces the paper trader with
@@ -866,6 +872,13 @@ class WalkForwardBacktester:
             inference_only: If True, skip PPO training and load existing
                 models from {run_dir}/rl_model_window_{wi}.  Useful for
                 re-evaluating with updated signals without retraining.
+            candidate_mode: How to select candidates during inference:
+                "top" (default), "random_l2", "bottom_l2", "random_l1".
+            action_mode: How to select actions during inference:
+                "policy" (default) — use trained PPO model;
+                "random" — random legal action;
+                "equal_weight" — 1/3 each slot, open timing (action 39),
+                    falls back to random if masked.
 
         Returns dict with keys: metrics, nav_series, window_results.
         """
@@ -971,7 +984,11 @@ class WalkForwardBacktester:
                 self.cfg.run_dir, f"rl_model_window_{wi}"
             )
 
-            if inference_only:
+            if action_mode != "policy":
+                # No model needed for random/equal_weight
+                model = None
+                print(f"  Skipping model load (action_mode={action_mode!r})")
+            elif inference_only:
                 # Load existing model — skip training entirely
                 try:
                     model = rl_trader.load(model_path)
@@ -1005,6 +1022,7 @@ class WalkForwardBacktester:
             test_env = PortfolioEnv(
                 self.cfg, test_signals, self._ohlcv,
                 benchmark_df, training_mode=False,
+                candidate_mode=candidate_mode,
             )
             masked_test_env = ActionMasker(test_env, lambda e: e.action_masks())
             obs, _ = masked_test_env.reset()
@@ -1014,9 +1032,20 @@ class WalkForwardBacktester:
 
             for step_i in range(len(test_signals) - 1):
                 masks = get_action_masks(masked_test_env)
-                action, _ = model.predict(
-                    obs, deterministic=True, action_masks=masks
-                )
+
+                if action_mode == "policy":
+                    action, _ = model.predict(
+                        obs, deterministic=True, action_masks=masks
+                    )
+                elif action_mode == "equal_weight":
+                    # Action 39 = (1/3, 1/3, 1/3, open, open, open)
+                    if masks[39]:
+                        action = 39
+                    else:
+                        action = np.random.choice(np.where(masks)[0])
+                else:  # "random"
+                    action = np.random.choice(np.where(masks)[0])
+
                 obs, reward, terminated, truncated, info = masked_test_env.step(
                     int(action)
                 )
