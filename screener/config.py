@@ -109,7 +109,7 @@ class ScreenerConfig:
 
     # ── Persistence ──────────────────────────────────────────────────────
     drive_root: str = "output/screener"
-    run_id: str = ""            # auto-set to YYYYMMDD_HHMMSS in __post_init__
+    run_id: str = "20260228_144143"  # pinned to first successful RL run
     alpha158_cache: str = ""    # auto-set in __post_init__
     model_cache: str = ""       # auto-set in __post_init__
 
